@@ -1,9 +1,9 @@
-﻿using System;
+﻿// Copyright (c) Jason Ma
+using System;
 using System.Collections.Generic;
-using System.IO;
+using System.Linq;
 using UnityEditor;
 using UnityEngine;
-using Object = UnityEngine.Object;
 
 namespace LWGUI
 {
@@ -16,81 +16,19 @@ namespace LWGUI
 		public static          float fieldWidth;
 		public static          float labelWidth;
 
-		private static Dictionary<Material /*Material*/, Dictionary<string /*Prop Name*/, MaterialProperty /*Prop*/>>
-			_defaultProps = new Dictionary<Material, Dictionary<string, MaterialProperty>>();
-
-		private static Dictionary<Shader, DateTime> _lastShaderModifiedTime = new Dictionary<Shader, DateTime>();
-		private static Dictionary<Material, Shader> _lastShaders            = new Dictionary<Material, Shader>();
-		private static bool                         _forceInit;
-
-
-		#region Init
-
-		private static void CheckProperty(Material material, MaterialProperty prop)
-		{
-			if (!(_defaultProps.ContainsKey(material) && _defaultProps[material].ContainsKey(prop.name)))
-			{
-				Debug.LogWarning("Uninitialized Shader:" + material.name + "or Prop:" + prop.name);
-				LWGUI.ForceInit();
-			}
-		}
-
-		public static void ForceInit() { _forceInit = true; }
-
-		/// <summary>
-		/// Detect Shader changes to know when to initialize
-		/// </summary>
-		public static bool InitAndHasShaderModified(Shader shader, Material material, MaterialProperty[] props)
-		{
-			var shaderPath = Application.dataPath.Substring(0, Application.dataPath.Length - 6) + AssetDatabase.GetAssetPath(shader);
-			Debug.Assert(File.Exists(shaderPath), "Unable to find Shader: " + shader.name + " in " + shaderPath + "!");
-
-			var currTime = (new FileInfo(shaderPath)).LastWriteTime;
-
-			// check for init
-			if (_forceInit
-			 || !_lastShaderModifiedTime.ContainsKey(shader)
-			 || _lastShaderModifiedTime[shader] != currTime
-			 || !_defaultProps.ContainsKey(material)
-			 || !_lastShaders.ContainsKey(material)
-			 || _lastShaders[material] != shader
-			   )
-			{
-				if (_lastShaderModifiedTime.ContainsKey(shader) && _lastShaderModifiedTime[shader] != currTime)
-					AssetDatabase.ImportAsset(AssetDatabase.GetAssetPath(shader));
-
-				_forceInit = false;
-				_lastShaders[material] = shader;
-				_lastShaderModifiedTime[shader] = currTime;
-			}
-			else
-				return false;
-
-			// Get and cache new props
-			var defaultMaterial = new Material(shader);
-			PresetHelper.ApplyPresetValue(props, defaultMaterial);
-			var newProps = MaterialEditor.GetMaterialProperties(new[] { defaultMaterial });
-			// Debug.Assert(newProps.Length == props.Length);
-
-			_defaultProps[material] = new Dictionary<string, MaterialProperty>();
-			foreach (var prop in newProps)
-			{
-				_defaultProps[material][prop.name] = prop;
-			}
-
-			return true;
-		}
-
-		#endregion
-
-
 		#region GUI Setting
 
-		public static Rect GetRevertButtonRect(MaterialProperty prop, Rect rect, bool isCallInDrawer = false)
+		public static void IndentRect(ref Rect rect)
 		{
-			// TODO: use Reflection
+			rect.xMax -= RevertableHelper.revertButtonWidth;
+		}
+
+		public static Rect SplitRevertButtonRect(ref Rect rect, bool isCallInDrawer = false)
+		{
 			float defaultHeightWithoutDrawers = EditorGUIUtility.singleLineHeight;
-			return GetRevertButtonRect(defaultHeightWithoutDrawers, rect, isCallInDrawer);
+			var revertButtonRect = GetRevertButtonRect(defaultHeightWithoutDrawers, rect, isCallInDrawer);
+			IndentRect(ref rect);
+			return revertButtonRect;
 		}
 
 		public static Rect GetRevertButtonRect(float propHeight, Rect rect, bool isCallInDrawer = false)
@@ -103,10 +41,32 @@ namespace LWGUI
 			return revertButtonRect;
 		}
 
+		public static void InitRevertableGUIWidths()
+		{
+			EditorGUIUtility.fieldWidth += RevertableHelper.revertButtonWidth;
+			EditorGUIUtility.labelWidth -= RevertableHelper.revertButtonWidth;
+			RevertableHelper.fieldWidth = EditorGUIUtility.fieldWidth;
+			RevertableHelper.labelWidth = EditorGUIUtility.labelWidth;
+		}
+
 		public static void SetRevertableGUIWidths()
 		{
 			EditorGUIUtility.fieldWidth = RevertableHelper.fieldWidth;
 			EditorGUIUtility.labelWidth = RevertableHelper.labelWidth;
+		}
+
+		public static void FixGUIWidthMismatch(MaterialProperty.PropType propType, MaterialEditor materialEditor)
+		{
+			switch (propType)
+			{
+				case MaterialProperty.PropType.Texture:
+				case MaterialProperty.PropType.Range:
+					materialEditor.SetDefaultGUIWidths();
+					break;
+				default:
+					RevertableHelper.SetRevertableGUIWidths();
+					break;
+			}
 		}
 
 		#endregion
@@ -125,22 +85,8 @@ namespace LWGUI
 #endif
 		}
 
-		public static void SetPropertyToDefault(Material material, MaterialProperty prop)
+		public static string GetPropertyDefaultValueText(MaterialProperty defaultProp)
 		{
-			CheckProperty(material, prop);
-			var defaultProp = _defaultProps[material][prop.name];
-			SetPropertyToDefault(defaultProp, prop);
-		}
-
-		public static MaterialProperty GetDefaultProperty(Material material, MaterialProperty prop)
-		{
-			CheckProperty(material, prop);
-			return _defaultProps[material][prop.name];
-		}
-
-		public static string GetPropertyDefaultValueText(Material material, MaterialProperty prop)
-		{
-			var defaultProp = GetDefaultProperty(material, prop);
 			string defaultText = String.Empty;
 			switch (defaultProp.type)
 			{
@@ -166,34 +112,61 @@ namespace LWGUI
 			return defaultText;
 		}
 
-		public static bool IsDefaultProperty(Material material, MaterialProperty prop)
-		{
-			CheckProperty(material, prop);
-			return Helper.PropertyValueEquals(prop, _defaultProps[material][prop.name]);
-		}
-
 		#endregion
 
 
 		#region Draw revert button
 
-		public static bool DrawRevertableProperty(Rect position, MaterialProperty prop, MaterialEditor materialEditor)
+		public static bool DrawRevertableProperty(Rect position, MaterialProperty prop, LWGUI lwgui, bool isHeader = false)
 		{
-			var material = materialEditor.target as Material;
-			CheckProperty(material, prop);
-			var defaultProp = _defaultProps[material][prop.name];
-			Rect rect = position;
-			if (Helper.PropertyValueEquals(prop, defaultProp) && !prop.hasMixedValue)
+			bool hasModified = prop.hasMixedValue;
+
+			var propDynamicData = lwgui.perFrameData.propertyDatas[prop.name];
+			var propStaticData = lwgui.perShaderData.propertyDatas[prop.name];
+			if (!hasModified)
+				hasModified = propDynamicData.hasModified;
+
+			if (!hasModified && isHeader)
+				hasModified = propDynamicData.hasChildrenModified;
+
+			var extraPropNames = lwgui.perShaderData.propertyDatas[prop.name].extraPropNames;
+			if (!hasModified && extraPropNames.Count > 0)
+				hasModified = extraPropNames.Any((extraPropName => lwgui.perFrameData.propertyDatas[extraPropName].hasModified));
+
+			if (!hasModified)
 				return false;
+
+			Rect rect = position;
 			if (DrawRevertButton(rect))
 			{
-				AddPropertyShouldRevert(prop.targets, prop.name);
-				SetPropertyToDefault(defaultProp, prop);
+				DoRevertProperty(prop, lwgui);
+
+				foreach (var childStaticData in propStaticData.children)
+				{
+					DoRevertProperty(lwgui.perFrameData.propertyDatas[childStaticData.name].property, lwgui);
+					foreach (var childChildStaticData in childStaticData.children)
+						DoRevertProperty(lwgui.perFrameData.propertyDatas[childChildStaticData.name].property, lwgui);
+				}
+
 				// refresh keywords
-				MaterialEditor.ApplyMaterialPropertyDrawers(materialEditor.targets);
+				MaterialEditor.ApplyMaterialPropertyDrawers(lwgui.materialEditor.targets);
 				return true;
 			}
 			return false;
+		}
+
+		private static void DoRevertProperty(MaterialProperty prop, LWGUI lwgui)
+		{
+			var propDynamicData = lwgui.perFrameData.propertyDatas[prop.name];
+			var extraPropNames = lwgui.perShaderData.propertyDatas[prop.name].extraPropNames;
+			propDynamicData.hasRevertChanged = true;
+			SetPropertyToDefault(propDynamicData.defualtProperty, prop);
+			foreach (var extraPropName in extraPropNames)
+			{
+				var extraPropDynamicData = lwgui.perFrameData.propertyDatas[extraPropName];
+				extraPropDynamicData.hasRevertChanged = true;
+				SetPropertyToDefault(extraPropDynamicData.defualtProperty, extraPropDynamicData.property);
+			}
 		}
 
 		private static readonly Texture _icon = AssetDatabase.LoadAssetAtPath<Texture>(AssetDatabase.GUIDToAssetPath("e7bc1130858d984488bca32b8512ca96"));
@@ -209,57 +182,6 @@ namespace LWGUI
 				return true;
 			}
 			return false;
-		}
-
-		#endregion
-
-
-		#region Call drawers to do revert and refresh keywords
-
-		private static Dictionary<Object, List<string>> _shouldRevertPropsPool;
-
-		public static void AddPropertyShouldRevert(Object[] materials, string propName)
-		{
-			if (_shouldRevertPropsPool == null)
-				_shouldRevertPropsPool = new Dictionary<Object, List<string>>();
-			foreach (var material in materials)
-			{
-				if (_shouldRevertPropsPool.ContainsKey(material))
-				{
-					if (!_shouldRevertPropsPool[material].Contains(propName))
-						_shouldRevertPropsPool[material].Add(propName);
-				}
-				else
-				{
-					_shouldRevertPropsPool.Add(material, new List<string> { propName });
-				}
-			}
-		}
-
-		public static void RemovePropertyShouldRevert(Object[] materials, string propName)
-		{
-			if (_shouldRevertPropsPool == null) return;
-			foreach (var material in materials)
-			{
-				if (_shouldRevertPropsPool.ContainsKey(material))
-				{
-					if (_shouldRevertPropsPool[material].Contains(propName))
-						_shouldRevertPropsPool[material].Remove(propName);
-				}
-			}
-		}
-
-		public static bool IsPropertyShouldRevert(Object material, string propName)
-		{
-			if (_shouldRevertPropsPool == null) return false;
-			if (_shouldRevertPropsPool.ContainsKey(material))
-			{
-				return _shouldRevertPropsPool[material].Contains(propName);
-			}
-			else
-			{
-				return false;
-			}
 		}
 
 		#endregion

@@ -1,54 +1,31 @@
 ﻿// Copyright (c) Jason Ma
-
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.Rendering;
 
 namespace LWGUI
 {
-	/// when LwguiEventType.Init:		get all metadata from drawer
-	/// when LwguiEventType.Repaint:	LWGUI decides how to draw each prop according to metadata
-	public enum LwguiEventType
-	{
-		Init,
-		Repaint
-	}
-	
-	public enum SearchMode
-	{
-		All,
-		Modified
-	}
-	
 	public delegate void LWGUICustomGUIEvent(LWGUI lwgui);
 
 	public class LWGUI : ShaderGUI
 	{
-		public        MaterialProperty[]                                props;
-		public        MaterialEditor                                    materialEditor;
-		public        Material                                          material;
-		public        Dictionary<string /*PropName*/, bool /*Display*/> searchResult;
-		public        string                                            searchingText     = String.Empty;
-		public        string                                            lastSearchingText = String.Empty;
-		public        SearchMode                                        searchMode        = SearchMode.All;
-		public        SearchMode                                        lastSearchMode    = SearchMode.All;
-		public        bool                                              updateSearchMode  = false;
-		public        LwguiEventType                                    lwguiEventType    = LwguiEventType.Init;
-		public        Shader                                            shader;
+		public MaterialProperty[] props;
+		public MaterialEditor     materialEditor;
+		public Material           material;
+		public Shader             shader;
+		public PerShaderData      perShaderData;
+		public PerFrameData       perFrameData;
 
-		public static LWGUICustomGUIEvent onCustomHeader;
-		public static LWGUICustomGUIEvent onCustomFooter;
+		public static LWGUICustomGUIEvent onDrawCustomHeader;
+		public static LWGUICustomGUIEvent onDrawCustomFooter;
 
-		private static bool _forceInit = false;
-		
 		/// <summary>
 		/// Called when switch to a new Material Window, each window has a LWGUI instance
 		/// </summary>
 		public LWGUI() { }
-
-		public static void ForceInit() { _forceInit = true; }
 
 		public override void OnGUI(MaterialEditor materialEditor, MaterialProperty[] props)
 		{
@@ -56,146 +33,150 @@ namespace LWGUI
 			this.materialEditor = materialEditor;
 			this.material = materialEditor.target as Material;
 			this.shader = this.material.shader;
-			this.lwguiEventType = RevertableHelper.InitAndHasShaderModified(shader, material, props) || _forceInit
-				? LwguiEventType.Init
-				: LwguiEventType.Repaint;
+			this.perShaderData = MetaDataHelper.BuildPerShaderData(shader, props);
+			this.perFrameData = MetaDataHelper.BuildPerFrameData(shader, material, props);
 
-			// reset caches and metadata
-			if (lwguiEventType == LwguiEventType.Init)
+
+			// Custom Header
+			if (onDrawCustomHeader != null)
+				onDrawCustomHeader(this);
+
+
+			// Toolbar
+			bool enabled = GUI.enabled;
+			GUI.enabled = true;
+			var toolBarRect = EditorGUILayout.GetControlRect();
+			toolBarRect.xMin = 2;
+
+			Helper.DrawToolbarButtons(ref toolBarRect, this);
+
+			Helper.DrawSearchField(toolBarRect, this);
+
+			GUILayoutUtility.GetRect(0, 0); // Space(0)
+			GUI.enabled = enabled;
+			Helper.DrawSplitLine();
+
+
+			// Properties
 			{
-				MetaDataHelper.ClearCaches(shader);
-				searchResult = null;
-				lastSearchingText = searchingText = string.Empty;
-				lastSearchMode = searchMode = SearchMode.All;
-				updateSearchMode = false;
-				_forceInit = false;
-				MetaDataHelper.ReregisterAllPropertyMetaData(shader, material, props);
-			}
-
-			// draw with metadata
-			{
-				if (onCustomHeader != null)
-					onCustomHeader(this);
-				
-				// Search Field
-				if (searchResult == null)
-					searchResult = MetaDataHelper.SearchProperties(shader, material, props, String.Empty, searchMode);
-
-				if (Helper.DrawSearchField(ref searchingText, ref searchMode, this) || updateSearchMode)
-				{
-					// change anything to expand all group
-					if ((string.IsNullOrEmpty(lastSearchingText) && lastSearchMode == SearchMode.All)) // last == init 
-						GroupStateHelper.SetAllGroupFoldingAndCache(materialEditor.target, false);
-					// restore to the cached state
-					else if ((string.IsNullOrEmpty(searchingText) && searchMode == SearchMode.All)) // now == init
-						GroupStateHelper.RestoreCachedFoldingState(materialEditor.target);
-
-					searchResult = MetaDataHelper.SearchProperties(shader, material, props, searchingText, searchMode);
-					lastSearchingText = searchingText;
-					lastSearchMode = searchMode;
-					updateSearchMode = false;
-				}
-
 				// move fields left to make rect for Revert Button
 				materialEditor.SetDefaultGUIWidths();
-				EditorGUIUtility.fieldWidth += RevertableHelper.revertButtonWidth;
-				EditorGUIUtility.labelWidth -= RevertableHelper.revertButtonWidth;
-				RevertableHelper.fieldWidth = EditorGUIUtility.fieldWidth;
-				RevertableHelper.labelWidth = EditorGUIUtility.labelWidth;
+				RevertableHelper.InitRevertableGUIWidths();
 
 				// start drawing properties
 				foreach (var prop in props)
 				{
-					// force init when missing prop
-					if (!searchResult.ContainsKey(prop.name))
+					var propStaticData = perShaderData.propertyDatas[prop.name];
+					var propDynamicData = perFrameData.propertyDatas[prop.name];
+
+					// Visibility
 					{
-						_forceInit = true;
-						return;
+						if (!MetaDataHelper.GetPropertyVisibility(prop, material, this))
+							continue;
+
+						if (propStaticData.parent != null
+							&& (!MetaDataHelper.GetParentPropertyVisibility(propStaticData.parent, material, this)
+								|| !MetaDataHelper.GetParentPropertyVisibility(propStaticData.parent.parent, material, this)))
+							continue;
 					}
 
-					// ignored hidden prop
-					if ((prop.flags & MaterialProperty.PropFlags.HideInInspector) != 0 || !searchResult[prop.name])
-						continue;
-
-					var height = materialEditor.GetPropertyHeight(prop, MetaDataHelper.GetPropertyDisplayName(shader, prop));
-
-					// ignored when in Folding Group
-					if (height <= 0) continue;
-
-					Helper.DrawHelpbox(shader, prop);
-
-					// get rect
-					var rect = EditorGUILayout.GetControlRect(true, height, EditorStyles.layerMaskField);
-					var revertButtonRect = RevertableHelper.GetRevertButtonRect(prop, rect);
-					rect.xMax -= RevertableHelper.revertButtonWidth;
-
-					PresetHelper.DrawAddPropertyToPresetMenu(rect, shader, prop, props);
-
-					// fix some builtin types display misplaced
-					switch (prop.type)
+					// Indent
+					var indentLevel = EditorGUI.indentLevel;
+					if (propStaticData.isAdvancedHeader)
+						EditorGUI.indentLevel++;
+					if (propStaticData.parent != null)
 					{
-						case MaterialProperty.PropType.Texture:
-						case MaterialProperty.PropType.Range:
-							materialEditor.SetDefaultGUIWidths();
-							break;
-						default:
+						EditorGUI.indentLevel++;
+						if (propStaticData.parent.parent != null)
+							EditorGUI.indentLevel++;
+					}
+
+					// Advanced Header
+					if (propStaticData.isAdvancedHeader && !propStaticData.isAdvancedHeaderProperty)
+					{
+						DrawAdvancedHeader(propStaticData, prop);
+
+						if (!propStaticData.isExpanding)
+						{
 							RevertableHelper.SetRevertableGUIWidths();
-							break;
+							EditorGUI.indentLevel = indentLevel;
+							continue;
+						}
 					}
 
-					RevertableHelper.DrawRevertableProperty(revertButtonRect, prop, materialEditor);
-					var label = new GUIContent(MetaDataHelper.GetPropertyDisplayName(shader, prop), MetaDataHelper.GetPropertyTooltip(shader, material, prop));
-					materialEditor.ShaderProperty(rect, prop, label);
+					DrawProperty(prop);
+
+					RevertableHelper.SetRevertableGUIWidths();
+					EditorGUI.indentLevel = indentLevel;
 				}
+
+				materialEditor.SetDefaultGUIWidths();
 			}
 
-			materialEditor.SetDefaultGUIWidths();
 
 			EditorGUILayout.Space();
+			Helper.DrawSplitLine();
 			EditorGUILayout.Space();
-			
-			if (onCustomFooter != null)
-				onCustomFooter(this);
-			
+
+
+			// Render settings
 #if UNITY_2019_4_OR_NEWER
 			if (SupportedRenderingFeatures.active.editableMaterialRenderQueue)
 #endif
-			materialEditor.RenderQueueField();
+			{
+				materialEditor.RenderQueueField();
+			}
 			materialEditor.EnableInstancingField();
 			materialEditor.LightmapEmissionProperty();
 			materialEditor.DoubleSidedGIField();
 
+
+			// Custom Footer
+			if (onDrawCustomFooter != null)
+				onDrawCustomFooter(this);
+
+
+			// LOGO
 			EditorGUILayout.Space();
 			Helper.DrawLogo();
 		}
 
-		/// <summary>
-		///   <para>Find shader properties.</para>
-		/// </summary>
-		/// <param name="propertyName">The name of the material property.</param>
-		/// <param name="properties">The array of available material properties.</param>
-		/// <param name="propertyIsMandatory">If true then this method will throw an exception if a property with propertyName was not found.</param>
-		/// <returns>
-		///   <para>The material property found, otherwise null.</para>
-		/// </returns>
-		public static MaterialProperty FindProp(string propertyName, MaterialProperty[] properties, bool propertyIsMandatory = false)
+		private void DrawAdvancedHeader(PropertyStaticData propStaticData, MaterialProperty prop)
 		{
-			MaterialProperty outProperty= null;
-			if (properties == null)
-			{
-				Debug.LogWarning("Get other properties form Drawer is only support Unity 2019.2+!");
-				return null;
-			}
-			
-			if (!string.IsNullOrEmpty(propertyName) && propertyName != "_")
-				outProperty = FindProperty(propertyName, properties, propertyIsMandatory);
-			else
-				return null;
-			
-			if (outProperty == null)
-				ForceInit();
-			
-			return outProperty;
+			var rect = EditorGUILayout.GetControlRect();
+			var revertButtonRect = RevertableHelper.SplitRevertButtonRect(ref rect);
+			var label = string.IsNullOrEmpty(propStaticData.advancedHeaderString) ? "Advanced" : propStaticData.advancedHeaderString;
+			propStaticData.isExpanding = EditorGUI.Foldout(rect, propStaticData.isExpanding, label);
+			if (Event.current.type == EventType.MouseDown && Event.current.button == 0 && rect.Contains(Event.current.mousePosition))
+				propStaticData.isExpanding = !propStaticData.isExpanding;
+			RevertableHelper.DrawRevertableProperty(revertButtonRect, prop, this, true);
+			Helper.DoPropertyContextMenus(rect, prop, this);
+		}
+
+		private void DrawProperty(MaterialProperty prop)
+		{
+			var propStaticData = perShaderData.propertyDatas[prop.name];
+			var propDynamicData = perFrameData.propertyDatas[prop.name];
+
+			Helper.DrawHelpbox(propStaticData, propDynamicData);
+
+			var label = new GUIContent(propStaticData.displayName, MetaDataHelper.GetPropertyTooltip(propStaticData, propDynamicData));
+			var height = materialEditor.GetPropertyHeight(prop, label.text);
+			var rect = EditorGUILayout.GetControlRect(true, height);
+
+			var revertButtonRect = RevertableHelper.SplitRevertButtonRect(ref rect);
+
+			var enabled = GUI.enabled;
+			if (propStaticData.isReadOnly) GUI.enabled = false;
+			Helper.BeginProperty(rect, prop, this);
+			Helper.DoPropertyContextMenus(rect, prop, this);
+			RevertableHelper.FixGUIWidthMismatch(prop.type, materialEditor);
+			if (propStaticData.isAdvancedHeaderProperty)
+				propStaticData.isExpanding = EditorGUI.Foldout(rect, propStaticData.isExpanding, string.Empty);
+			RevertableHelper.DrawRevertableProperty(revertButtonRect, prop, this, propStaticData.isMain || propStaticData.isAdvancedHeaderProperty);
+			materialEditor.ShaderProperty(rect, prop, label);
+			Helper.EndProperty(this, prop);
+			GUI.enabled = enabled;
 		}
 	}
 } //namespace LWGUI

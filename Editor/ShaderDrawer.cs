@@ -1,17 +1,24 @@
 ﻿// Copyright (c) 2022 Jason Ma
-
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.Rendering;
 using Object = UnityEngine.Object;
 
 namespace LWGUI
 {
 	public interface IBaseDrawer
 	{
-		void InitMetaData(Shader inShader, Material inMaterial, MaterialProperty inProp, MaterialProperty[] inProps);
+		void BuildStaticMetaData(Shader inShader, MaterialProperty inProp, MaterialProperty[] inProps, PropertyStaticData inoutPropertyStaticData);
+
+		void GetDefaultValueDescription(Shader inShader, MaterialProperty inProp, MaterialProperty inDefaultProp, PerShaderData inPerShaderData, PerFrameData inoutPerFrameData);
+	}
+
+	public interface IBasePresetDrawer
+	{
+		ShaderPropertyPreset.Preset GetActivePreset(MaterialProperty inProp, ShaderPropertyPreset shaderPropertyPreset);
 	}
 	
 	/// <summary>
@@ -47,39 +54,45 @@ namespace LWGUI
 		{
 			this._group = group;
 			this._keyword = keyword;
-			this._defaultFoldingState = defaultFoldingState == "on";
-			this._defaultToggleDisplayed = defaultToggleDisplayed == "on";
+			this._defaultFoldingState = defaultFoldingState.ToLower() == "on";
+			this._defaultToggleDisplayed = defaultToggleDisplayed.ToLower() == "on";
 		}
 
-		public virtual void InitMetaData(Shader inShader, Material inMaterial, MaterialProperty inProp, MaterialProperty[] inProps)
+
+		public virtual void BuildStaticMetaData(Shader inShader, MaterialProperty inProp, MaterialProperty[] inProps, PropertyStaticData inoutPropertyStaticData)
 		{
-			MetaDataHelper.RegisterMainProp(inShader, inProp, _group);
-			MetaDataHelper.RegisterPropertyDefaultValueText(inShader, inProp, 
-															RevertableHelper.GetDefaultProperty(inMaterial, inProp).floatValue > 0 ? "On" : "Off");
+			inoutPropertyStaticData.groupName = _group;
+			inoutPropertyStaticData.isMain = true;
+			inoutPropertyStaticData.isExpanding = _defaultFoldingState;
 		}
-		
+
+		public virtual void GetDefaultValueDescription(Shader           inShader,
+													   MaterialProperty inProp,
+													   MaterialProperty inDefaultProp,
+													   PerShaderData    inPerShaderData,
+													   PerFrameData     inoutPerFrameData)
+		{
+			inoutPerFrameData.propertyDatas[inProp.name].defaultValueDescription = inDefaultProp.floatValue > 0 ? "On" : "Off";
+		}
+
 		public override void OnGUI(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor)
 		{
 			EditorGUI.showMixedValue = prop.hasMixedValue;
 			lwgui = Helper.GetLWGUI(editor);
 			props = lwgui.props;
 			shader = lwgui.shader;
-			
-			var toggleValue = prop.floatValue > 0;
-			string finalGroupName = (_group != String.Empty && _group != "_") ? _group : prop.name;
-			bool isFirstFrame = !GroupStateHelper.ContainsGroup(editor.target, finalGroupName);
-			_isFolding = isFirstFrame ? !_defaultFoldingState : GroupStateHelper.GetGroupFolding(editor.target, finalGroupName);
+
+			var propertyStaticData = lwgui.perShaderData.propertyDatas[prop.name];
 
 			EditorGUI.BeginChangeCheck();
-			bool toggleResult = Helper.Foldout(position, ref _isFolding, toggleValue, _defaultToggleDisplayed, label);
 
-			if (EditorGUI.EndChangeCheck())
+			bool toggleResult = Helper.DrawFoldout(position, ref propertyStaticData.isExpanding, prop.floatValue > 0, _defaultToggleDisplayed, label);
+
+			if (Helper.EndChangeCheck(lwgui, prop))
 			{
 				prop.floatValue = toggleResult ? 1.0f : 0.0f;
 				Helper.SetShaderKeyWord(editor.targets, Helper.GetKeyWord(_keyword, prop.name), toggleResult);
 			}
-
-			GroupStateHelper.SetGroupFolding(editor.target, finalGroupName, _isFolding);
 		}
 
 		// Call in custom shader gui
@@ -88,16 +101,16 @@ namespace LWGUI
 			return _height;
 		}
 
-		// Call when creating new material 
+		// Call when creating new material, used to set keywords
 		public override void Apply(MaterialProperty prop)
 		{
 			base.Apply(prop);
 			if (!prop.hasMixedValue
 			 && (prop.type == MaterialProperty.PropType.Float
 #if UNITY_2021_1_OR_NEWER
-									 || prop.type == MaterialProperty.PropType.Int
+				|| prop.type == MaterialProperty.PropType.Int
 #endif
-										))
+			))
 				Helper.SetShaderKeyWord(prop.targets, Helper.GetKeyWord(_keyword, prop.name), prop.floatValue > 0f);
 		}
 	}
@@ -109,11 +122,11 @@ namespace LWGUI
 	/// </summary>
 	public class SubDrawer : MaterialPropertyDrawer, IBaseDrawer
 	{
-		protected string             group = String.Empty;
-		protected MaterialProperty   prop;
-		protected MaterialProperty[] props;
-		protected LWGUI              lwgui;
-		protected Shader             shader;
+		public string             group = String.Empty;
+		public MaterialProperty   prop;
+		public MaterialProperty[] props;
+		public LWGUI              lwgui;
+		public Shader             shader;
 
 		public SubDrawer() { }
 
@@ -130,10 +143,16 @@ namespace LWGUI
 			return prop.type == MaterialProperty.PropType.Vector ? EditorGUIUtility.singleLineHeight : height;
 		}
 
-		public virtual void InitMetaData(Shader inShader, Material inMaterial, MaterialProperty inProp, MaterialProperty[] inProps)
+		public virtual void BuildStaticMetaData(Shader inShader, MaterialProperty inProp, MaterialProperty[] inProps, PropertyStaticData inoutPropertyStaticData)
 		{
-			MetaDataHelper.RegisterSubProp(inShader, inProp, group);
+			inoutPropertyStaticData.groupName = group;
 		}
+
+		public virtual void GetDefaultValueDescription(Shader           inShader,
+													   MaterialProperty inProp,
+													   MaterialProperty inDefaultProp,
+													   PerShaderData    inPerShaderData,
+													   PerFrameData     inoutPerFrameData) { }
 
 		public override void OnGUI(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor)
 		{
@@ -142,49 +161,27 @@ namespace LWGUI
 			props = lwgui.props;
 			shader = lwgui.shader;
 
-			
-			var rect = position;
-			
-			if (group != String.Empty && group != "_")
-				EditorGUI.indentLevel++;
-			
-			if (GroupStateHelper.IsSubVisible(editor.target, group))
+			if (IsMatchPropType(prop))
 			{
-				if (IsMatchPropType(prop))
-				{
-					RevertableHelper.SetRevertableGUIWidths();
-					DrawProp(rect, prop, label, editor);
-				}
-				else
-				{
-					Debug.LogWarning("Property:'" + prop.name + "' Type:'" + prop.type + "' mismatch!");
-					editor.DefaultShaderProperty(rect, prop, label.text);
-				}
+				DrawProp(position, prop, label, editor);
 			}
-
-			if (group != String.Empty && group != "_")
-				EditorGUI.indentLevel--;
+			else
+			{
+				Debug.LogWarning("Property:'" + prop.name + "' Type:'" + prop.type + "' mismatch!");
+				editor.DefaultShaderProperty(position, prop, label.text);
+			}
 		}
 
 		public override float GetPropertyHeight(MaterialProperty prop, string label, MaterialEditor editor)
 		{
-			return GroupStateHelper.IsSubVisible(editor.target, group) ? GetVisibleHeight(prop) : 0;
+			return GetVisibleHeight(prop);
 		}
 
 		// Draws a custom style property
 		public virtual void DrawProp(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor)
 		{
-			// Process some builtin types display misplaced
-			switch (prop.type)
-			{
-				case MaterialProperty.PropType.Texture:
-				case MaterialProperty.PropType.Range:
-					editor.SetDefaultGUIWidths();
-					break;
-			}
-			// TODO: use Reflection
-			editor.DefaultShaderProperty(position, prop, label.text);
-			GUI.Label(position, new GUIContent(String.Empty, label.tooltip));
+			RevertableHelper.FixGUIWidthMismatch(prop.type, editor);
+			ReflectionHelper.DefaultShaderPropertyInternal(editor, position, prop, label);
 		}
 	}
 
@@ -209,27 +206,26 @@ namespace LWGUI
 		
 		protected override bool IsMatchPropType(MaterialProperty property) { return property.type == MaterialProperty.PropType.Float; }
 
-		public override void InitMetaData(Shader inShader, Material inMaterial, MaterialProperty inProp, MaterialProperty[] inProps)
+		public override void GetDefaultValueDescription(Shader           inShader,
+														MaterialProperty inProp,
+														MaterialProperty inDefaultProp,
+														PerShaderData    inPerShaderData,
+														PerFrameData     inoutPerFrameData)
 		{
-			base.InitMetaData(inShader, inMaterial, inProp, inProps);
-			MetaDataHelper.RegisterPropertyDefaultValueText(inShader, inProp, 
-															RevertableHelper.GetDefaultProperty(inMaterial, inProp).floatValue > 0 ? "On" : "Off");
+			inoutPerFrameData.propertyDatas[inProp.name].defaultValueDescription = inDefaultProp.floatValue > 0 ? "On" : "Off";
 		}
 
 		public override void DrawProp(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor)
 		{
-			EditorGUI.showMixedValue = prop.hasMixedValue;
 			EditorGUI.BeginChangeCheck();
-			var rect = position;//EditorGUILayout.GetControlRect();
-			var value = EditorGUI.Toggle(rect, label, prop.floatValue > 0.0f);
+			EditorGUI.showMixedValue = prop.hasMixedValue;
+			var value = EditorGUI.Toggle(position, label, prop.floatValue > 0.0f);
 			string k = Helper.GetKeyWord(_keyWord, prop.name);
-			if (EditorGUI.EndChangeCheck())
+			if (Helper.EndChangeCheck(lwgui, prop))
 			{
 				prop.floatValue = value ? 1.0f : 0.0f;
 				Helper.SetShaderKeyWord(editor.targets, k, value);
 			}
-
-			GroupStateHelper.SetKeywordConditionalDisplay(editor.target, k, value);
 			EditorGUI.showMixedValue = false;
 		}
 
@@ -263,10 +259,10 @@ namespace LWGUI
 		
 		public override void DrawProp(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor)
 		{
-			editor.SetDefaultGUIWidths();
+			RevertableHelper.FixGUIWidthMismatch(prop.type, editor);
 			EditorGUI.showMixedValue = prop.hasMixedValue;
-			var rect = position; //EditorGUILayout.GetControlRect();
-			Helper.PowerSlider(prop, _power, rect, label);
+			var rect = position;
+			ReflectionHelper.DoPowerRangeProperty(rect, prop, label, _power);
 			EditorGUI.showMixedValue = false;
 		}
 	}
@@ -287,15 +283,14 @@ namespace LWGUI
 		
 		public override void DrawProp(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor)
 		{
+			RevertableHelper.FixGUIWidthMismatch(prop.type, editor);
+
 			if (prop.type != MaterialProperty.PropType.Range)
 			{
 				EditorGUI.LabelField(position, "IntRange used on a non-range property: " + prop.name, EditorStyles.helpBox);
 			}
 			else
 			{
-				editor.SetDefaultGUIWidths();
-				EditorGUI.showMixedValue = prop.hasMixedValue;
-				
 				EditorGUI.BeginChangeCheck();
 				EditorGUI.showMixedValue = prop.hasMixedValue;
 				float labelWidth = EditorGUIUtility.labelWidth;
@@ -303,12 +298,128 @@ namespace LWGUI
 				int num = EditorGUI.IntSlider(position, label, (int) prop.floatValue, (int) prop.rangeLimits.x, (int) prop.rangeLimits.y);
 				EditorGUI.showMixedValue = false;
 				EditorGUIUtility.labelWidth = labelWidth;
-				if (EditorGUI.EndChangeCheck())
+				if (Helper.EndChangeCheck(lwgui, prop))
+				{
 					prop.floatValue = num;
+				}
 			}
 		}
 	}
-	
+
+	/// <summary>
+	/// Draw a min max slider
+	/// group：father group name, support suffix keyword for conditional display (Default: none)
+	/// minPropName: Output Min Property Name
+	/// maxPropName: Output Max Property Name
+	/// Target Property Type: Range, range limits express the MinMaxSlider value range
+	/// Output Min/Max Property Type: Range, it's value is limited by it's range
+	/// </summary>
+	public class MinMaxSliderDrawer : SubDrawer
+	{
+		private string _minPropName;
+		private string _maxPropName;
+
+		public MinMaxSliderDrawer(string minPropName, string maxPropName) : this("_", minPropName, maxPropName) { }
+		public MinMaxSliderDrawer(string group, string minPropName, string maxPropName)
+		{
+			this.group = group;
+			this._minPropName = minPropName;
+			this._maxPropName = maxPropName;
+		}
+
+		protected override bool IsMatchPropType(MaterialProperty property) { return property.type == MaterialProperty.PropType.Range; }
+
+		public override void BuildStaticMetaData(Shader inShader, MaterialProperty inProp, MaterialProperty[] inProps, PropertyStaticData inoutPropertyStaticData)
+		{
+			base.BuildStaticMetaData(inShader, inProp, inProps, inoutPropertyStaticData);
+			inoutPropertyStaticData.AddExtraProperty(_minPropName);
+			inoutPropertyStaticData.AddExtraProperty(_maxPropName);
+		}
+
+		public override void GetDefaultValueDescription(Shader           inShader,
+														MaterialProperty inProp,
+														MaterialProperty inDefaultProp,
+														PerShaderData    inPerShaderData,
+														PerFrameData     inoutPerFrameData)
+		{
+			if (string.IsNullOrEmpty(_minPropName)
+			 || string.IsNullOrEmpty(_maxPropName)
+			 || !inoutPerFrameData.propertyDatas.ContainsKey(_minPropName)
+			 || !inoutPerFrameData.propertyDatas.ContainsKey(_maxPropName)
+			   )
+			{
+				Debug.LogError(inProp.name + " has no available min/max properties!");
+				return;
+			}
+
+			inoutPerFrameData.propertyDatas[inProp.name].defaultValueDescription =
+				inoutPerFrameData.GetDefaultProperty(_minPropName).floatValue + " - " +
+				inoutPerFrameData.GetDefaultProperty(_maxPropName).floatValue;
+		}
+
+		public override void DrawProp(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor)
+		{
+			// read min max
+			MaterialProperty minProp = lwgui.perFrameData.GetProperty(_minPropName);
+			MaterialProperty maxProp = lwgui.perFrameData.GetProperty(_maxPropName);
+			if (minProp == null || maxProp == null)
+			{
+				Debug.LogError("MinMaxSliderDrawer: minProp: " + (minProp == null ? "null" : minProp.name) + " or maxProp: " + (maxProp == null ? "null" : maxProp.name) + " not found!");
+				return;
+			}
+			float minf = minProp.floatValue;
+			float maxf = maxProp.floatValue;
+
+			// define draw area
+			Rect controlRect = position; // this is the full length rect area
+			var w = EditorGUIUtility.labelWidth;
+			EditorGUIUtility.labelWidth = 0;
+			Rect inputRect = MaterialEditor.GetRectAfterLabelWidth(controlRect); // this is the remaining rect area after label's area
+
+			// draw label
+			EditorGUI.PrefixLabel(controlRect, label);
+
+			// draw min max slider
+			var indentLevel = EditorGUI.indentLevel;
+			EditorGUI.indentLevel = 0;
+			Rect[] splittedRect = Helper.SplitRect(inputRect, 3);
+
+			EditorGUI.BeginChangeCheck();
+			EditorGUI.showMixedValue = minProp.hasMixedValue;
+			var newMinf = EditorGUI.FloatField(splittedRect[0], minf);
+			if (Helper.EndChangeCheck(lwgui, minProp))
+			{
+				minf = Mathf.Clamp(newMinf, minProp.rangeLimits.x, minProp.rangeLimits.y);
+				minProp.floatValue = minf;
+			}
+
+			EditorGUI.BeginChangeCheck();
+			EditorGUI.showMixedValue = maxProp.hasMixedValue;
+			var newMaxf = EditorGUI.FloatField(splittedRect[2], maxf);
+			if (Helper.EndChangeCheck(lwgui, maxProp))
+			{
+				maxf = Mathf.Clamp(newMaxf, maxProp.rangeLimits.x, maxProp.rangeLimits.y);
+				maxProp.floatValue = maxf;
+			}
+
+			EditorGUI.BeginChangeCheck();
+			EditorGUI.showMixedValue = prop.hasMixedValue;
+			if (splittedRect[1].width > 50f)
+				EditorGUI.MinMaxSlider(splittedRect[1], ref minf, ref maxf, prop.rangeLimits.x, prop.rangeLimits.y);
+			EditorGUI.showMixedValue = false;
+
+			// write back min max if changed
+			if (EditorGUI.EndChangeCheck())
+			{
+				minProp.floatValue = Mathf.Clamp(minf, minProp.rangeLimits.x, minProp.rangeLimits.y);
+				maxProp.floatValue = Mathf.Clamp(maxf, maxProp.rangeLimits.x, maxProp.rangeLimits.y);
+			}
+
+			EditorGUI.indentLevel = indentLevel;
+			EditorGUIUtility.labelWidth = w;
+		}
+	}
+
 	/// <summary>
 	/// Similar to builtin Enum() / KeywordEnum()
 	/// group：father group name, support suffix keyword for conditional display (Default: none)
@@ -390,12 +501,15 @@ namespace LWGUI
 
 		protected virtual string GetKeywordName(string propName, string name) { return (name).Replace(' ', '_').ToUpperInvariant(); }
 
-		public override void InitMetaData(Shader inShader, Material inMaterial, MaterialProperty inProp, MaterialProperty[] inProps)
+		public override void GetDefaultValueDescription(Shader           inShader,
+														MaterialProperty inProp,
+														MaterialProperty inDefaultProp,
+														PerShaderData    inPerShaderData,
+														PerFrameData     inoutPerFrameData)
 		{
-			base.InitMetaData(inShader, inMaterial, inProp, inProps);
-			var index = (int)RevertableHelper.GetDefaultProperty(inMaterial, inProp).floatValue;
+			var index = Array.IndexOf(_values, (int)inDefaultProp.floatValue);
 			if (index < _names.Length && index >= 0)
-				MetaDataHelper.RegisterPropertyDefaultValueText(inShader, inProp, _names[index].text);
+				inoutPerFrameData.propertyDatas[inProp.name].defaultValueDescription = _names[index].text;
 		}
 
 		private string[] GetKeywords(MaterialProperty property)
@@ -411,35 +525,23 @@ namespace LWGUI
 			EditorGUI.BeginChangeCheck();
         	EditorGUI.showMixedValue = prop.hasMixedValue;
         	
-			var rect = position; //EditorGUILayout.GetControlRect();
+			var rect = position;
 
 			string[] keyWords = GetKeywords(prop);
 			int index = Array.IndexOf(_values, prop.floatValue);
 			if (index < 0)
 			{
-				index = 0;
-				if (!prop.hasMixedValue)
-				{
-					Debug.LogError("Property: " + MetaDataHelper.GetPropertyDisplayName(shader, prop) + " has unknown Enum Value: '" + prop.floatValue + "' !\n"
-								 + "It will be set to: '" + _values[index] + "'!");
-					prop.floatValue = _values[index];
-					Helper.SetShaderKeyWord(editor.targets, keyWords, index);
-				}
+				Debug.LogError("Property: " + prop.name + " has unknown Enum Value: '" + prop.floatValue + "' !\n");
+				return;
 			}
 
-			Helper.AdaptiveFieldWidth(EditorStyles.popup, _names[index], EditorStyles.popup.lineHeight);
+			Helper.AdaptiveFieldWidth(EditorStyles.popup, _names[index]);
 			int newIndex = EditorGUI.Popup(rect, label, index, _names);
 			EditorGUI.showMixedValue = false;
-			if (EditorGUI.EndChangeCheck())
+			if (Helper.EndChangeCheck(lwgui, prop))
 			{
 				prop.floatValue = _values[newIndex];
 				Helper.SetShaderKeyWord(editor.targets, keyWords, newIndex);
-			}
-			
-			// set keyword for conditional display
-			for (int i = 0; i < keyWords.Length; i++)
-			{
-				GroupStateHelper.SetKeywordConditionalDisplay(editor.target, keyWords[i], newIndex == i);
 			}
 		}
 
@@ -518,14 +620,14 @@ namespace LWGUI
 	/// <summary>
 	/// Draw a Texture property in single line with a extra property
 	/// group：father group name, support suffix keyword for conditional display (Default: none)
-	/// extraPropName: extra property name (Unity 2019.2+ only) (Default: none)
+	/// extraPropName: extra property name (Default: none)
 	/// Target Property Type: Texture
-	/// Extra Property Type: Any, except Texture
+	/// Extra Property Type: Color, Vector
 	/// </summary>
 	public class TexDrawer : SubDrawer
 	{
 		private string        _extraPropName = String.Empty;
-		private ChannelDrawer _channelDrawer = new ChannelDrawer("_");
+		private ChannelDrawer _channelDrawer = new ChannelDrawer();
 
 		protected override float GetVisibleHeight(MaterialProperty prop) { return EditorGUIUtility.singleLineHeight; }
 
@@ -541,89 +643,67 @@ namespace LWGUI
 
 		protected override bool IsMatchPropType(MaterialProperty property) { return property.type == MaterialProperty.PropType.Texture; }
 
-		public override void InitMetaData(Shader inShader, Material inMaterial, MaterialProperty inProp, MaterialProperty[] inProps)
+		public override void BuildStaticMetaData(Shader inShader, MaterialProperty inProp, MaterialProperty[] inProps, PropertyStaticData inoutPropertyStaticData)
 		{
-			MaterialProperty extraProp = LWGUI.FindProp(_extraPropName, inProps, true);
-			MetaDataHelper.RegisterSubProp(inShader, inProp, group, extraProp == null ? null : new []{extraProp});
-			if (extraProp != null)
+			base.BuildStaticMetaData(inShader, inProp, inProps, inoutPropertyStaticData);
+			inoutPropertyStaticData.AddExtraProperty(_extraPropName);
+		}
+
+		public override void GetDefaultValueDescription(Shader           inShader,
+														MaterialProperty inProp,
+														MaterialProperty inDefaultProp,
+														PerShaderData    inPerShaderData,
+														PerFrameData     inoutPerFrameData)
+		{
+			var defaultExtraProp = inoutPerFrameData.GetDefaultProperty(_extraPropName);
+			if (defaultExtraProp != null)
 			{
 				var text = string.Empty;
-				if (extraProp.type == MaterialProperty.PropType.Vector)
-					text = ChannelDrawer.GetChannelName(extraProp);
+				if (defaultExtraProp.type == MaterialProperty.PropType.Vector)
+					text = ChannelDrawer.GetChannelName(defaultExtraProp);
 				else
-					text = RevertableHelper.GetPropertyDefaultValueText(inMaterial, extraProp);
-				
-				MetaDataHelper.RegisterPropertyDefaultValueText(inShader, inProp, 
-																RevertableHelper.GetPropertyDefaultValueText(inMaterial, inProp) + ", " + text);
+					text = RevertableHelper.GetPropertyDefaultValueText(defaultExtraProp);
+
+				inoutPerFrameData.propertyDatas[inProp.name].defaultValueDescription =
+					RevertableHelper.GetPropertyDefaultValueText(inDefaultProp) + ", " + text;
 			}
 		}
 
 		public override void DrawProp(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor)
 		{
 			EditorGUI.showMixedValue = prop.hasMixedValue;
-			var rect = position; //EditorGUILayout.GetControlRect();
-			var texLabel = label.text;
+			var rect = position;
 
-			MaterialProperty extraProp = LWGUI.FindProp(_extraPropName, props, true);
-			if (extraProp != null && extraProp.type != MaterialProperty.PropType.Texture)
+			MaterialProperty extraProp = lwgui.perFrameData.GetProperty(_extraPropName);
+			if (extraProp != null && (
+					extraProp.type == MaterialProperty.PropType.Color
+					|| extraProp.type == MaterialProperty.PropType.Vector
+				))
 			{
 				var i = EditorGUI.indentLevel;
-				Rect indentedRect, extraPropRect = new Rect(rect);
-				switch (extraProp.type)
-				{
-#if UNITY_2021_1_OR_NEWER
-					case MaterialProperty.PropType.Int:
-#endif
-					case MaterialProperty.PropType.Color:
-					case MaterialProperty.PropType.Float:
-					case MaterialProperty.PropType.Vector:
-						texLabel = string.Empty;
-						indentedRect = EditorGUI.IndentedRect(extraPropRect);
-						RevertableHelper.SetRevertableGUIWidths();
-						EditorGUIUtility.labelWidth -= (indentedRect.xMin - extraPropRect.xMin) + 30f;
-						extraPropRect = indentedRect;
-						extraPropRect.xMin += 30f;
-						EditorGUI.indentLevel = 0;
-						break;
-					case MaterialProperty.PropType.Range:
-						label.text = string.Empty;
-						indentedRect = EditorGUI.IndentedRect(extraPropRect);
-						editor.SetDefaultGUIWidths();
-						EditorGUIUtility.fieldWidth += 1f;
-						EditorGUIUtility.labelWidth = 0;
-						EditorGUI.indentLevel = 0;
-						extraPropRect = MaterialEditor.GetRectAfterLabelWidth(extraPropRect);
-						extraPropRect.xMin += 2;
-						break;
-				}
+				EditorGUI.indentLevel = 0;
+
+				var extraRect = MaterialEditor.GetRightAlignedFieldRect(rect);
+				extraRect.height = rect.height;
 
 				if (extraProp.type == MaterialProperty.PropType.Vector)
-					_channelDrawer.DrawProp(extraPropRect, extraProp, label, editor);
+					_channelDrawer.OnGUI(extraRect, extraProp, GUIContent.none, editor);
 				else
-					editor.ShaderProperty(extraPropRect, extraProp, label);
-				
-				EditorGUI.indentLevel = i;
+					editor.ShaderProperty(extraRect, extraProp, GUIContent.none);
 
-				var revertButtonRect = RevertableHelper.GetRevertButtonRect(extraProp, position, true);
-				if (RevertableHelper.IsPropertyShouldRevert(editor.target, prop.name) ||
-					RevertableHelper.DrawRevertableProperty(revertButtonRect, extraProp, editor))
-				{
-					RevertableHelper.SetPropertyToDefault(lwgui.material, prop);
-					RevertableHelper.SetPropertyToDefault(lwgui.material, extraProp);
-					RevertableHelper.RemovePropertyShouldRevert(editor.targets, prop.name);
-				}
+				EditorGUI.indentLevel = i;
 			}
 			
-			editor.TexturePropertyMiniThumbnail(rect, prop, texLabel, label.tooltip);
+			editor.TexturePropertyMiniThumbnail(rect, prop, label.text, label.tooltip);
 
 			EditorGUI.showMixedValue = false;
 		}
 	}
-	
+
 	/// <summary>
 	/// Display up to 4 colors in a single line
 	/// group：father group name, support suffix keyword for conditional display (Default: none)
-	/// color2-4: extra color property name (Unity 2019.2+ only)
+	/// color2-4: extra color property name
 	/// Target Property Type: Color
 	/// </summary>
 	public class ColorDrawer : SubDrawer
@@ -644,16 +724,13 @@ namespace LWGUI
 		
 		protected override bool IsMatchPropType(MaterialProperty property) { return property.type == MaterialProperty.PropType.Color; }
 
-		public override void InitMetaData(Shader inShader, Material inMaterial, MaterialProperty inProp, MaterialProperty[] inProps)
+		public override void BuildStaticMetaData(Shader inShader, MaterialProperty inProp, MaterialProperty[] inProps, PropertyStaticData inoutPropertyStaticData)
 		{
-			var extraColorProps = new List<MaterialProperty>();
-			foreach (var extraColorProp in _colorStrings)
+			base.BuildStaticMetaData(inShader, inProp, inProps, inoutPropertyStaticData);
+			foreach (var colorPropName in _colorStrings)
 			{
-				var p = LWGUI.FindProp(extraColorProp, inProps);
-				if (p != null && IsMatchPropType(p))
-					extraColorProps.Add(p);
+				inoutPropertyStaticData.AddExtraProperty(colorPropName);
 			}
-			MetaDataHelper.RegisterSubProp(inShader, inProp, group, extraColorProps.ToArray());
 		}
 
 		public override void DrawProp(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor)
@@ -667,7 +744,7 @@ namespace LWGUI
 					continue;
 				}
 
-				var p = LWGUI.FindProp(_colorStrings[i - 1], props);
+				var p = lwgui.perFrameData.GetProperty(_colorStrings[i - 1]);
 				if (p != null && IsMatchPropType(p))
 					cProps.Push(p);
 			}
@@ -680,6 +757,7 @@ namespace LWGUI
 
 			for (int i = 0; i < count; i++)
 			{
+				EditorGUI.BeginChangeCheck();
 				var cProp = colorArray[i];
 				EditorGUI.showMixedValue = cProp.hasMixedValue;
 				Rect r = new Rect(rect);
@@ -688,7 +766,6 @@ namespace LWGUI
 				r.xMin += r.width - w * (i + 1) + interval;
 				r.xMax -= w * i - interval;
 
-				EditorGUI.BeginChangeCheck();
 				Color src, dst;
 				src = cProp.colorValue;
 				var isHdr = (colorArray[i].flags & MaterialProperty.PropFlags.HDR) != MaterialProperty.PropFlags.None;
@@ -697,31 +774,102 @@ namespace LWGUI
 												, new ColorPickerHDRConfig(0.0f, float.MaxValue, 0.0f, float.MaxValue)
 										   #endif
 										   );
-				if (EditorGUI.EndChangeCheck())
+				if (Helper.EndChangeCheck(lwgui, cProp))
 				{
 					cProp.colorValue = dst;
 				}
 			}
 
-			var revertButtonRect = RevertableHelper.GetRevertButtonRect(prop, position, true);
-			bool[] shouldRevert = new bool[count];
-			shouldRevert[count - 1] = RevertableHelper.IsPropertyShouldRevert(editor.target, prop.name);
-			for (int i = 0; i < shouldRevert.Length - 1; i++)
-			{
-				shouldRevert[i] = RevertableHelper.DrawRevertableProperty(revertButtonRect, colorArray[i], editor);
-			}
-
-			if (shouldRevert.Contains(true))
-			{
-				if (shouldRevert[count - 1])
-					RevertableHelper.RemovePropertyShouldRevert(editor.targets, prop.name);
-				for (int i = 0; i < count; i++)
-				{
-					RevertableHelper.SetPropertyToDefault(lwgui.material, colorArray[i]);
-				}
-			}
-
 			EditorGUI.showMixedValue = false;
+		}
+	}
+
+	/// <summary>
+	/// Draw a R/G/B/A drop menu:
+	/// 	R = (1, 0, 0, 0)
+	/// 	G = (0, 1, 0, 0)
+	/// 	B = (0, 0, 1, 0)
+	/// 	A = (0, 0, 0, 1)
+	/// 	RGB Average = (1f / 3f, 1f / 3f, 1f / 3f, 0)
+	/// 	RGB Luminance = (0.2126f, 0.7152f, 0.0722f, 0)
+	///		None = (0, 0, 0, 0)
+	/// group：father group name, support suffix keyword for conditional display (Default: none)
+	/// Target Property Type: Vector, used to dot() with Texture Sample Value
+	/// </summary>
+	public class ChannelDrawer : SubDrawer
+	{
+		private static GUIContent[] _names = new[] {
+			new GUIContent("R"),
+			new GUIContent("G"),
+			new GUIContent("B"),
+			new GUIContent("A"),
+			new GUIContent("RGB Average"),
+			new GUIContent("RGB Luminance"),
+			new GUIContent("None")
+		};
+		private static int[] _intValues = new int[] { 0, 1, 2, 3, 4, 5, 6 };
+		private static Vector4[] _vector4Values = new[]
+		{
+			new Vector4(1, 0, 0, 0),
+			new Vector4(0, 1, 0, 0),
+			new Vector4(0, 0, 1, 0),
+			new Vector4(0, 0, 0, 1),
+			new Vector4(1f / 3f, 1f / 3f, 1f / 3f, 0),
+			new Vector4(0.2126f, 0.7152f, 0.0722f, 0),
+			new Vector4(0, 0, 0, 0)
+		};
+
+		public ChannelDrawer() { }
+		public ChannelDrawer(string group)
+		{
+			this.group = group;
+		}
+
+		protected override bool IsMatchPropType(MaterialProperty property) { return property.type == MaterialProperty.PropType.Vector; }
+
+		private static int GetChannelIndex(MaterialProperty prop)
+		{
+			int index = -1;
+			for (int i = 0; i < _vector4Values.Length; i++)
+			{
+				if (prop.vectorValue == _vector4Values[i])
+					index = i;
+			}
+			if (index == -1)
+			{
+				Debug.LogError("Channel Property: " + prop.name + " invalid vector found, reset to A");
+				prop.vectorValue = _vector4Values[3];
+				index = 3;
+			}
+			return index;
+		}
+
+		public static string GetChannelName(MaterialProperty prop)
+		{
+			return _names[GetChannelIndex(prop)].text;
+		}
+
+		public override void GetDefaultValueDescription(Shader           inShader,
+														MaterialProperty inProp,
+														MaterialProperty inDefaultProp,
+														PerShaderData    inPerShaderData,
+														PerFrameData     inoutPerFrameData)
+		{
+			inoutPerFrameData.propertyDatas[inProp.name].defaultValueDescription = GetChannelName(inDefaultProp);
+		}
+
+		public override void DrawProp(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor)
+		{
+			EditorGUI.BeginChangeCheck();
+
+			EditorGUI.showMixedValue = prop.hasMixedValue;
+			var index = GetChannelIndex(prop);
+			int num = EditorGUI.IntPopup(position, label, index, _names, _intValues);
+			EditorGUI.showMixedValue = false;
+			if (Helper.EndChangeCheck(lwgui, prop))
+			{
+				prop.vectorValue = _vector4Values[num];
+			}
 		}
 	}
 
@@ -795,7 +943,7 @@ namespace LWGUI
 			// per prop variables
 			bool isDirty;
 			// used to read/write Gradient value in code
-			RampHelper.GradientObject gradientObject = ScriptableObject.CreateInstance<RampHelper.GradientObject>();
+			GradientObject gradientObject = ScriptableObject.CreateInstance<GradientObject>();
 			// used to modify Gradient value for users
 			SerializedObject serializedObject = new SerializedObject(gradientObject);
 			SerializedProperty serializedProperty = serializedObject.FindProperty("gradient");
@@ -868,9 +1016,9 @@ namespace LWGUI
 				// Manual replace ramp map
 				EditorGUI.BeginChangeCheck();
 				var newManualSelectedTexture = (Texture2D)EditorGUI.ObjectField(rampFieldRect, prop.textureValue, typeof(Texture2D), false);
-				if (EditorGUI.EndChangeCheck())
+				if (Helper.EndChangeCheck(lwgui, prop))
 				{
-					if (AssetDatabase.GetAssetPath(newManualSelectedTexture).StartsWith(_rootPath))
+					if (newManualSelectedTexture && AssetDatabase.GetAssetPath(newManualSelectedTexture).StartsWith(_rootPath))
 						OnSwitchRampMapEvent(newManualSelectedTexture);
 					else 
 						EditorUtility.DisplayDialog("Invalid Path", "Please select the subdirectory of '" + _rootPath + "'", "OK");
@@ -893,201 +1041,13 @@ namespace LWGUI
 	}
 
 	/// <summary>
-	/// Draw a min max slider (Unity 2019.2+ only)
-	/// group：father group name, support suffix keyword for conditional display (Default: none)
-	/// minPropName: Output Min Property Name
-	/// maxPropName: Output Max Property Name
-	/// Target Property Type: Range, range limits express the MinMaxSlider value range
-	/// Output Min/Max Property Type: Range, it's value is limited by it's range
-	/// </summary>
-	public class MinMaxSliderDrawer : SubDrawer
-	{
-		private string _minPropName;
-		private string _maxPropName;
-
-		public MinMaxSliderDrawer(string minPropName, string maxPropName) : this("_", minPropName, maxPropName) { }
-		public MinMaxSliderDrawer(string group, string minPropName, string maxPropName)
-		{
-			this.group = group;
-			this._minPropName = minPropName;
-			this._maxPropName = maxPropName;
-		}
-
-		protected override bool IsMatchPropType(MaterialProperty property) { return property.type == MaterialProperty.PropType.Range; }
-
-		public override void InitMetaData(Shader inShader, Material inMaterial, MaterialProperty inProp, MaterialProperty[] inProps)
-		{
-			var minProp = LWGUI.FindProp(_minPropName, inProps, true);
-			var maxProp = LWGUI.FindProp(_maxPropName, inProps, true);
-			MetaDataHelper.RegisterSubProp(inShader, inProp, group, new []{ minProp, maxProp });
-			MetaDataHelper.RegisterPropertyDefaultValueText(inShader, inProp,
-															RevertableHelper.GetDefaultProperty(inMaterial, minProp).floatValue + " - " + 
-															RevertableHelper.GetDefaultProperty(inMaterial, maxProp).floatValue);
-		}
-
-		public override void DrawProp(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor)
-		{
-			// read min max
-			MaterialProperty minProp = LWGUI.FindProp(_minPropName, props, true);
-			MaterialProperty maxProp = LWGUI.FindProp(_maxPropName, props, true);
-			if (minProp == null || maxProp == null)
-			{
-				Debug.LogError("MinMaxSliderDrawer: minProp: " + (minProp == null ? "null" : minProp.name) + " or maxProp: " + (maxProp == null ? "null" : maxProp.name) + " not found!");
-				return;
-			}
-			float minf = minProp.floatValue;
-			float maxf = maxProp.floatValue;
-
-			// define draw area
-			Rect controlRect = position; //EditorGUILayout.GetControlRect(); // this is the full length rect area
-			var w = EditorGUIUtility.labelWidth;
-			EditorGUIUtility.labelWidth = 0;
-			Rect inputRect = MaterialEditor.GetRectAfterLabelWidth(controlRect); // this is the remaining rect area after label's area
-			EditorGUIUtility.labelWidth = w;
-
-			// draw label
-			EditorGUI.PrefixLabel(controlRect, label);
-
-			// draw min max slider
-			Rect[] splittedRect = Helper.SplitRect(inputRect, 3);
-
-			EditorGUI.BeginChangeCheck();
-			EditorGUI.showMixedValue = minProp.hasMixedValue;
-			var newMinf = EditorGUI.FloatField(splittedRect[0], minf);
-			if (EditorGUI.EndChangeCheck())
-			{
-				minf = Mathf.Clamp(newMinf, minProp.rangeLimits.x, minProp.rangeLimits.y);
-				minProp.floatValue = minf;
-			}
-			
-			EditorGUI.BeginChangeCheck();
-			EditorGUI.showMixedValue = maxProp.hasMixedValue;
-			var newMaxf = EditorGUI.FloatField(splittedRect[2], maxf);
-			if (EditorGUI.EndChangeCheck())
-			{
-				maxf = Mathf.Clamp(newMaxf, maxProp.rangeLimits.x, maxProp.rangeLimits.y);
-				maxProp.floatValue = maxf;
-			}
-
-			EditorGUI.BeginChangeCheck();
-			EditorGUI.showMixedValue = prop.hasMixedValue;
-			if (splittedRect[1].width > 50f)
-				EditorGUI.MinMaxSlider(splittedRect[1], ref minf, ref maxf, prop.rangeLimits.x, prop.rangeLimits.y);
-			EditorGUI.showMixedValue = false;
-
-			// write back min max if changed
-			if (EditorGUI.EndChangeCheck())
-			{
-				minProp.floatValue = Mathf.Clamp(minf, minProp.rangeLimits.x, minProp.rangeLimits.y);
-				maxProp.floatValue = Mathf.Clamp(maxf, maxProp.rangeLimits.x, maxProp.rangeLimits.y);
-			}
-
-			var revertButtonRect = RevertableHelper.GetRevertButtonRect(prop, position, true);
-			if (RevertableHelper.DrawRevertableProperty(revertButtonRect, minProp, editor) ||
-				RevertableHelper.DrawRevertableProperty(revertButtonRect, maxProp, editor))
-			{
-				RevertableHelper.SetPropertyToDefault(lwgui.material, minProp);
-				RevertableHelper.SetPropertyToDefault(lwgui.material, maxProp);
-			}
-
-		}
-	}
-
-	/// <summary>
-	/// Draw a R/G/B/A drop menu:
-	/// 	R = (1, 0, 0, 0)
-	/// 	G = (0, 1, 0, 0)
-	/// 	B = (0, 0, 1, 0)
-	/// 	A = (0, 0, 0, 1)
-	/// 	RGB Average = (1f / 3f, 1f / 3f, 1f / 3f, 0)
-	/// 	RGB Luminance = (0.2126f, 0.7152f, 0.0722f, 0)
-	///		None = (0, 0, 0, 0)
-	/// group：father group name, support suffix keyword for conditional display (Default: none)
-	/// Target Property Type: Vector, used to dot() with Texture Sample Value 
-	/// </summary>
-	public class ChannelDrawer : SubDrawer
-	{
-		private static GUIContent[] _names  = new[] { 
-			new GUIContent("R"), 
-			new GUIContent("G"), 
-			new GUIContent("B"), 
-			new GUIContent("A"),
-			new GUIContent("RGB Average"), 
-			new GUIContent("RGB Luminance"), 
-			new GUIContent("None") 
-		};
-		private static int[]     _intValues     = new int[] { 0, 1, 2, 3, 4, 5, 6 };
-		private static Vector4[] _vector4Values = new[]
-		{
-			new Vector4(1, 0, 0, 0),
-			new Vector4(0, 1, 0, 0),
-			new Vector4(0, 0, 1, 0),
-			new Vector4(0, 0, 0, 1),
-			new Vector4(1f / 3f, 1f / 3f, 1f / 3f, 0),
-			new Vector4(0.2126f, 0.7152f, 0.0722f, 0),
-			new Vector4(0, 0, 0, 0)
-		};
-
-		public ChannelDrawer() { }
-		public ChannelDrawer(string group)
-		{
-			this.group = group;
-		}
-
-		protected override bool IsMatchPropType(MaterialProperty property) { return property.type == MaterialProperty.PropType.Vector; }
-
-		private static int GetChannelIndex(MaterialProperty prop)
-		{
-			int index = -1;
-			for (int i = 0; i < _vector4Values.Length; i++)
-			{
-				if (prop.vectorValue == _vector4Values[i])
-					index = i;
-			}
-			if (index == -1)
-			{
-				Debug.LogError("Channel Property: " + prop.name + " invalid vector found, reset to A");
-				prop.vectorValue = _vector4Values[3];
-				index = 3;
-			}
-			return index;
-		}
-
-		public static string GetChannelName(MaterialProperty prop)
-		{
-			return _names[GetChannelIndex(prop)].text;
-		}
-
-		public override void InitMetaData(Shader inShader, Material inMaterial, MaterialProperty inProp, MaterialProperty[] inProps)
-		{
-			base.InitMetaData(inShader, inMaterial, inProp, inProps);
-			MetaDataHelper.RegisterPropertyDefaultValueText(inShader, inProp, GetChannelName(RevertableHelper.GetDefaultProperty(inMaterial, inProp)));
-		}
-
-		public override void DrawProp(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor)
-		{
-			var rect = position; //EditorGUILayout.GetControlRect();
-			var index = GetChannelIndex(prop);
-
-			EditorGUI.BeginChangeCheck();
-			EditorGUI.showMixedValue = prop.hasMixedValue;
-			int num = EditorGUI.IntPopup(rect, label, index, _names, _intValues);
-			EditorGUI.showMixedValue = false;
-			if (EditorGUI.EndChangeCheck())
-			{
-				prop.vectorValue = _vector4Values[num];
-			}
-		}
-	}
-
-	/// <summary>
 	/// Popping a menu, you can select the Shader Property Preset, the Preset values will replaces the default values
 	/// group：father group name, support suffix keyword for conditional display (Default: none)
 	///	presetFileName: "Shader Property Preset" asset name, you can create new Preset by
 	///		"Right Click > Create > LWGUI > Shader Property Preset" in Project window,
 	///		*any Preset in the entire project cannot have the same name*
 	/// </summary>
-	public class PresetDrawer : SubDrawer
+	public class PresetDrawer : SubDrawer, IBasePresetDrawer
 	{
 		public string presetFileName;
 		public PresetDrawer(string presetFileName) : this("_", presetFileName) {}
@@ -1099,19 +1059,34 @@ namespace LWGUI
 
 		protected override bool IsMatchPropType(MaterialProperty property) { return property.type == MaterialProperty.PropType.Float; }
 
-		public override void InitMetaData(Shader inShader, Material inMaterial, MaterialProperty inProp, MaterialProperty[] inProps)
+		public override void BuildStaticMetaData(Shader inShader, MaterialProperty inProp, MaterialProperty[] inProps, PropertyStaticData inoutPropertyStaticData)
 		{
-			base.InitMetaData(inShader, inMaterial, inProp, inProps);
-			var preset = PresetHelper.GetPresetFile(presetFileName);
-			if (preset == null) return;
-			
-			var presetNames = preset.presets.Select(((inPreset) => (inPreset.presetName))).ToArray();
-			var index = (int)RevertableHelper.GetDefaultProperty(inMaterial, inProp).floatValue;
-			if (index < presetNames.Length && index >= 0)
-				MetaDataHelper.RegisterPropertyDefaultValueText(inShader, inProp, presetNames[index]);
-			index = (int)inProp.floatValue;
-			if (index < presetNames.Length && index >= 0)
-				MetaDataHelper.RegisterPropertyPreset(inShader, inProp, preset);
+			base.BuildStaticMetaData(inShader, inProp, inProps, inoutPropertyStaticData);
+			inoutPropertyStaticData.propertyPresetAsset = PresetHelper.GetPresetFile(presetFileName);
+		}
+
+		public override void GetDefaultValueDescription(Shader           inShader,
+														MaterialProperty inProp,
+														MaterialProperty inDefaultProp,
+														PerShaderData    inPerShaderData,
+														PerFrameData     inoutPerFrameData)
+		{
+			var index = (int)inDefaultProp.floatValue;
+			var propertyPreset = inPerShaderData.propertyDatas[inProp.name].propertyPresetAsset;
+
+			if (propertyPreset && index < propertyPreset.presets.Count && index >= 0)
+				inoutPerFrameData.propertyDatas[inProp.name].defaultValueDescription = propertyPreset.presets[index].presetName;
+		}
+
+		public ShaderPropertyPreset.Preset GetActivePreset(MaterialProperty inProp, ShaderPropertyPreset shaderPropertyPreset)
+		{
+			ShaderPropertyPreset.Preset preset = null;
+			var index = (int)inProp.floatValue;
+			if (shaderPropertyPreset && index >= 0 && index < shaderPropertyPreset.presets.Count)
+			{
+				preset = shaderPropertyPreset.presets[index];
+			}
+			return preset;
 		}
 
 		public override void DrawProp(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor)
@@ -1122,8 +1097,8 @@ namespace LWGUI
 			var rect = position;
 
 			int index = (int)Mathf.Max(0, prop.floatValue);
-			var preset = PresetHelper.GetPresetFile(presetFileName);
-			if (preset == null || preset.presets.Count == 0)
+			var presetFile = PresetHelper.GetPresetFile(presetFileName);
+			if (presetFile == null || presetFile.presets.Count == 0)
 			{
 				var c = GUI.color;
 				GUI.color = Color.red;
@@ -1132,24 +1107,24 @@ namespace LWGUI
 				GUI.color = c;
 				return;
 			}
-			
-			var presetNames = preset.presets.Select(((inPreset) => new GUIContent(inPreset.presetName))).ToArray();
-			Helper.AdaptiveFieldWidth(EditorStyles.popup, presetNames[index], EditorStyles.popup.lineHeight);
+
+			var presetNames = presetFile.presets.Select(((inPreset) => new GUIContent(inPreset.presetName))).ToArray();
+			Helper.AdaptiveFieldWidth(EditorStyles.popup, presetNames[index]);
 			int newIndex = EditorGUI.Popup(rect, label, index, presetNames);
-			EditorGUI.showMixedValue = false;
-			if (EditorGUI.EndChangeCheck())
+			if (Helper.EndChangeCheck(lwgui, prop))
 			{
 				prop.floatValue = newIndex;
-				preset.Apply(prop.targets.Select((o => o as Material)).ToArray(), (int)prop.floatValue);
-				RevertableHelper.ForceInit();
+				presetFile.presets[newIndex].ApplyToEditingMaterial(prop.targets, lwgui.perFrameData);
 			}
+			EditorGUI.showMixedValue = false;
+		}
 
-			if (RevertableHelper.IsPropertyShouldRevert(prop.targets[0], prop.name))
-			{
-				preset.Apply(prop.targets.Select((o => o as Material)).ToArray(), (int)prop.floatValue);
-				RevertableHelper.ForceInit();
-				RevertableHelper.RemovePropertyShouldRevert(prop.targets, prop.name);
-			}
+		public override void Apply(MaterialProperty prop)
+		{
+			base.Apply(prop);
+			var presetFile = PresetHelper.GetPresetFile(presetFileName);
+			if (presetFile != null && prop.floatValue < presetFile.presets.Count)
+				presetFile.presets[(int)prop.floatValue].ApplyKeywordsToMaterials(prop.targets);
 		}
 	}
 	
@@ -1168,7 +1143,7 @@ namespace LWGUI
 
 		protected override float GetVisibleHeight(MaterialProperty prop) { return _height; }
 
-		public override void InitMetaData(Shader inShader, Material inMaterial, MaterialProperty inProp, MaterialProperty[] inProps) { }
+		public override void BuildStaticMetaData(Shader inShader, MaterialProperty inProp, MaterialProperty[] inProps, PropertyStaticData inoutPropertyStaticData) {}
 
 		public TitleDecorator(string header) : this("_", header, DefaultHeight) {}
 		public TitleDecorator(string header, float  height) : this("_", header, height) {}
@@ -1190,7 +1165,85 @@ namespace LWGUI
 		}
 	}
 
-	
+	/// <summary>
+	/// Similar to Title()
+	/// group：father group name, support suffix keyword for conditional display (Default: none)
+	/// header: string to display, "SpaceLine" or "_" = none (Default: none)
+	/// height: line height (Default: 22)
+	/// </summary>
+	public class SubTitleDecorator : TitleDecorator
+	{
+		public SubTitleDecorator(string group,  string header) : base(group, header, DefaultHeight) {}
+		public SubTitleDecorator(string group, string header, float height) : base(group, header, height) {}
+	}
+
+	/// <summary>
+	/// Tooltip, describes the details of the property. (Default: property.name and property default value)
+	/// You can also use "#Text" in DisplayName to add Tooltip that supports Multi-Language.
+	/// tooltip：a single-line string to display, support up to 4 ','. (Default: Newline)
+	/// </summary>
+	public class TooltipDecorator : SubDrawer
+	{
+		private string _tooltip;
+
+		#region
+
+		public TooltipDecorator() : this(string.Empty) {}
+
+		public TooltipDecorator(string tooltip) { this._tooltip = tooltip; }
+
+		public TooltipDecorator(string s1, string s2) : this(s1 + ", " + s2) { }
+
+		public TooltipDecorator(string s1, string s2, string s3) : this(s1 + ", " + s2 + ", " + s3) { }
+
+		public TooltipDecorator(string s1, string s2, string s3, string s4) : this(s1 + ", " + s2 + ", " + s3 + ", " + s4) { }
+
+		public TooltipDecorator(string s1, string s2, string s3, string s4, string s5) : this(s1 + ", " + s2 + ", " + s3 + ", " + s4 + ", " + s5) { }
+
+		#endregion
+
+
+		protected override float GetVisibleHeight(MaterialProperty prop) { return 0; }
+
+		public override void BuildStaticMetaData(Shader inShader, MaterialProperty inProp, MaterialProperty[] inProps, PropertyStaticData inoutPropertyStaticData)
+		{
+			inoutPropertyStaticData.tooltipMessages += _tooltip + "\n";
+		}
+
+		public override void DrawProp(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor) { }
+	}
+
+	/// <summary>
+	/// Display a Helpbox on the property
+	/// You can also use "%Text" in DisplayName to add Helpbox that supports Multi-Language.
+	/// message：a single-line string to display, support up to 4 ','. (Default: Newline)
+	/// </summary>
+	public class HelpboxDecorator : TooltipDecorator
+	{
+		private string _message;
+
+		#region
+
+		public HelpboxDecorator() : this(string.Empty) {}
+
+		public HelpboxDecorator(string message) { this._message = message; }
+
+		public HelpboxDecorator(string s1, string s2) : this(s1 + ", " + s2) { }
+
+		public HelpboxDecorator(string s1, string s2, string s3) : this(s1 + ", " + s2 + ", " + s3) { }
+
+		public HelpboxDecorator(string s1, string s2, string s3, string s4) : this(s1 + ", " + s2 + ", " + s3 + ", " + s4) { }
+
+		public HelpboxDecorator(string s1, string s2, string s3, string s4, string s5) : this(s1 + ", " + s2 + ", " + s3 + ", " + s4 + ", " + s5) { }
+
+		#endregion
+
+		public override void BuildStaticMetaData(Shader inShader, MaterialProperty inProp, MaterialProperty[] inProps, PropertyStaticData inoutPropertyStaticData)
+		{
+			inoutPropertyStaticData.helpboxMessages += _message + "\n";
+		}
+	}
+
 	/// <summary>
 	/// Cooperate with Toggle to switch certain Passes
 	/// lightModeName(s): Light Mode in Shader Pass (https://docs.unity3d.com/2017.4/Documentation/Manual/SL-PassTags.html)
@@ -1198,15 +1251,22 @@ namespace LWGUI
 	public class PassSwitchDecorator : SubDrawer
 	{
 		private string[] _lightModeNames;
-		
-		public PassSwitchDecorator(string   lightModeName1) : this(new[] { lightModeName1}){}
-		public PassSwitchDecorator(string   lightModeName1, string lightModeName2) : this(new[] { lightModeName1, lightModeName2}){}
-		public PassSwitchDecorator(string   lightModeName1, string lightModeName2, string lightModeName3) : this(new[] { lightModeName1, lightModeName2, lightModeName3}){}
-		public PassSwitchDecorator(string   lightModeName1, string lightModeName2, string lightModeName3, string lightModeName4) : this(new[] { lightModeName1, lightModeName2, lightModeName3, lightModeName4 }){}
-		public PassSwitchDecorator(string   lightModeName1, string lightModeName2, string lightModeName3, string lightModeName4, string lightModeName5) : this(new[] { lightModeName1, lightModeName2, lightModeName3, lightModeName4, lightModeName5 }){}
-		public PassSwitchDecorator(string   lightModeName1, string lightModeName2, string lightModeName3, string lightModeName4, string lightModeName5, string lightModeName6) : this(new[] { lightModeName1, lightModeName2, lightModeName3, lightModeName4, lightModeName5, lightModeName6 }){}
+
+		#region
+		public PassSwitchDecorator(string   lightModeName1)
+			: this(new[] { lightModeName1}){}
+		public PassSwitchDecorator(string   lightModeName1, string lightModeName2)
+			: this(new[] { lightModeName1, lightModeName2}){}
+		public PassSwitchDecorator(string   lightModeName1, string lightModeName2, string lightModeName3)
+			: this(new[] { lightModeName1, lightModeName2, lightModeName3}){}
+		public PassSwitchDecorator(string   lightModeName1, string lightModeName2, string lightModeName3, string lightModeName4)
+			: this(new[] { lightModeName1, lightModeName2, lightModeName3, lightModeName4 }){}
+		public PassSwitchDecorator(string   lightModeName1, string lightModeName2, string lightModeName3, string lightModeName4, string lightModeName5)
+			: this(new[] { lightModeName1, lightModeName2, lightModeName3, lightModeName4, lightModeName5 }){}
+		public PassSwitchDecorator(string   lightModeName1, string lightModeName2, string lightModeName3, string lightModeName4, string lightModeName5, string lightModeName6)
+			: this(new[] { lightModeName1, lightModeName2, lightModeName3, lightModeName4, lightModeName5, lightModeName6 }){}
 		public PassSwitchDecorator(string[] passNames) { _lightModeNames = passNames.Select((s => s.ToUpper())).ToArray(); }
-		
+		#endregion
 
 		protected override float GetVisibleHeight(MaterialProperty prop) { return 0; }
 
@@ -1214,12 +1274,12 @@ namespace LWGUI
 		{
 			return property.type == MaterialProperty.PropType.Float
 #if UNITY_2021_1_OR_NEWER
-									 || property.type == MaterialProperty.PropType.Int
+				|| property.type == MaterialProperty.PropType.Int
 #endif
 				;
 		}
 
-		public override void InitMetaData(Shader inShader, Material inMaterial, MaterialProperty inProp, MaterialProperty[] inProps) { }
+		public override void BuildStaticMetaData(Shader inShader, MaterialProperty inProp, MaterialProperty[] inProps, PropertyStaticData inoutPropertyStaticData) { }
 
 		public override void DrawProp(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor)
 		{
@@ -1236,70 +1296,126 @@ namespace LWGUI
 	}
 
 	/// <summary>
-	/// Tooltip, describes the details of the property. (Default: property.name and property default value)
-	/// You can also use "#Text" in DisplayName to add Tooltip that supports Multi-Language.
-	/// tooltip：a single-line string to display, support up to 4 ','. (Default: Newline)
+	/// Collapse the current Property into an Advanced Block. Specify the Header String to create a new Advanced Block. All Properties using Advanced() will be collapsed into the nearest Advanced Block.
+	/// headerString: The title of the Advanced Block. Default: "Advanced"
 	/// </summary>
-	public class TooltipDecorator : SubDrawer
+	public class AdvancedDecorator : SubDrawer
 	{
-		private string _tooltip;
+		private string headerString;
 
+		public AdvancedDecorator() : this(string.Empty) { }
 
-		#region 
-
-		public TooltipDecorator() { }
-		
-		public TooltipDecorator(string s1, string s2) : this(s1 + ", " + s2) { }
-		
-		public TooltipDecorator(string s1, string s2, string s3) : this(s1 + ", " + s2 + ", " + s3) { }
-		
-		public TooltipDecorator(string s1, string s2, string s3, string s4) : this(s1 + ", " + s2 + ", " + s3 + ", " + s4) { }
-		
-		public TooltipDecorator(string s1, string s2, string s3, string s4, string s5) : this(s1 + ", " + s2 + ", " + s3 + ", " + s4 + ", " + s5) { }
-		
-		public TooltipDecorator(string tooltip) { this._tooltip = tooltip; }
-		#endregion
-
+		public AdvancedDecorator(string headerString)
+		{
+			this.headerString = headerString;
+		}
 
 		protected override float GetVisibleHeight(MaterialProperty prop) { return 0; }
-		
-		public override void InitMetaData(Shader inShader, Material inMaterial, MaterialProperty inProp, MaterialProperty[] inProps)
+
+		public override void BuildStaticMetaData(Shader inShader, MaterialProperty inProp, MaterialProperty[] inProps, PropertyStaticData inoutPropertyStaticData)
 		{
-			MetaDataHelper.RegisterPropertyTooltip(inShader, inProp, _tooltip);
+			inoutPropertyStaticData.isAdvanced = true;
+			inoutPropertyStaticData.advancedHeaderString = headerString;
 		}
 
 		public override void DrawProp(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor) { }
 	}
 
 	/// <summary>
-	/// Display a Helpbox on the property
-	/// You can also use "%Text" in DisplayName to add Helpbox that supports Multi-Language.
-	/// message：a single-line string to display, support up to 4 ','. (Default: Newline)
+	/// Create an Advanced Block using the current Property as the Header
 	/// </summary>
-	public class HelpboxDecorator : TooltipDecorator
+	public class AdvancedHeaderPropertyDecorator : SubDrawer
 	{
-		private string _message;
+		protected override float GetVisibleHeight(MaterialProperty prop) { return 0; }
 
-
-		#region 
-		public HelpboxDecorator() { }
-		
-		public HelpboxDecorator(string s1, string s2) : this(s1 + ", " + s2) { }
-		
-		public HelpboxDecorator(string s1, string s2, string s3) : this(s1 + ", " + s2 + ", " + s3) { }
-		
-		public HelpboxDecorator(string s1, string s2, string s3, string s4) : this(s1 + ", " + s2 + ", " + s3 + ", " + s4) { }
-		
-		public HelpboxDecorator(string s1, string s2, string s3, string s4, string s5) : this(s1 + ", " + s2 + ", " + s3 + ", " + s4 + ", " + s5) { }
-
-		public HelpboxDecorator(string message) { this._message = message; }
-		#endregion
-
-
-		public override void InitMetaData(Shader inShader, Material inMaterial, MaterialProperty inProp, MaterialProperty[] inProps)
+		public override void BuildStaticMetaData(Shader inShader, MaterialProperty inProp, MaterialProperty[] inProps, PropertyStaticData inoutPropertyStaticData)
 		{
-			MetaDataHelper.RegisterPropertyHelpbox(inShader, inProp, _message);
+			inoutPropertyStaticData.isAdvanced = true;
+			inoutPropertyStaticData.isAdvancedHeader = true;
+			inoutPropertyStaticData.isAdvancedHeaderProperty = true;
 		}
+
+		public override void DrawProp(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor) { }
 	}
 
+	/// <summary>
+	/// Similar to HideInInspector(), the difference is that Hidden() can be unhidden through the Display Mode button.
+	/// </summary>
+	public class HiddenDecorator : SubDrawer
+	{
+		protected override float GetVisibleHeight(MaterialProperty prop) { return 0; }
+
+		public override void BuildStaticMetaData(Shader inShader, MaterialProperty inProp, MaterialProperty[] inProps, PropertyStaticData inoutPropertyStaticData)
+		{
+			inoutPropertyStaticData.isHidden = true;
+		}
+
+		public override void DrawProp(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor) { }
+	}
+
+	/// <summary>
+	/// Set the property to read-only.
+	/// </summary>
+	public class ReadOnlyDecorator : SubDrawer
+	{
+		protected override float GetVisibleHeight(MaterialProperty prop) { return 0; }
+
+		public override void BuildStaticMetaData(Shader inShader, MaterialProperty inProp, MaterialProperty[] inProps, PropertyStaticData inoutPropertyStaticData)
+		{
+			inoutPropertyStaticData.isReadOnly = true;
+		}
+
+		public override void DrawProp(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor) { }
+	}
+
+	/// <summary>
+	/// Control the show or hide of a single or a group of properties based on multiple conditions.
+	/// logicalOperator: And | Or (Default: And).
+	/// propName: Target Property Name used for comparison.
+	/// compareFunction: Less (L) | Equal (E) | LessEqual (LEqual / LE) | Greater (G) | NotEqual (NEqual / NE) | GreaterEqual (GEqual / GE).
+	/// value: Target Property Value used for comparison.
+	/// </summary>
+	public class ShowIfDecorator : SubDrawer
+	{
+		private ShowIfData _showIfData = new ShowIfData();
+		private readonly Dictionary<string, string> _compareFunctionLUT = new Dictionary<string, string>()
+		{
+			{ "Less",			"Less" },
+			{ "L",				"Less" },
+			{ "Equal",			"Equal" },
+			{ "E",				"Equal" },
+			{ "LessEqual",		"LessEqual" },
+			{ "LEqual",			"LessEqual" },
+			{ "LE",				"LessEqual" },
+			{ "Greater",		"Greater" },
+			{ "G",				"Greater" },
+			{ "NotEqual",		"NotEqual" },
+			{ "NEqual",			"NotEqual" },
+			{ "NE",				"NotEqual" },
+			{ "GreaterEqual",	"GreaterEqual" },
+			{ "GEqual",			"GreaterEqual" },
+			{ "GE",				"GreaterEqual" },
+		};
+
+		public ShowIfDecorator(string propName, string comparisonMethod, float value) : this("And", propName, comparisonMethod, value) { }
+		public ShowIfDecorator(string logicalOperator, string propName, string compareFunction, float value)
+		{
+			_showIfData.logicalOperator = logicalOperator.ToLower() == "or" ? LogicalOperator.Or : LogicalOperator.And;
+			_showIfData.targetPropertyName = propName;
+			if (!_compareFunctionLUT.ContainsKey(compareFunction) || !Enum.IsDefined(typeof(CompareFunction), _compareFunctionLUT[compareFunction]))
+				Debug.LogError("Invalid compareFunction: '" + compareFunction + "', Must be one of the following: Less (L) | Equal (E) | LessEqual (LEqual / LE) | Greater (G) | NotEqual (NEqual / NE) | GreaterEqual (GEqual / GE).");
+			else
+				_showIfData.compareFunction = (CompareFunction)Enum.Parse(typeof(CompareFunction), _compareFunctionLUT[compareFunction]);
+			_showIfData.value = value;
+		}
+
+		protected override float GetVisibleHeight(MaterialProperty prop) { return 0; }
+
+		public override void BuildStaticMetaData(Shader inShader, MaterialProperty inProp, MaterialProperty[] inProps, PropertyStaticData inoutPropertyStaticData)
+		{
+			inoutPropertyStaticData.showIfDatas.Add(_showIfData);
+		}
+
+		public override void DrawProp(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor) { }
+	}
 } //namespace LWGUI

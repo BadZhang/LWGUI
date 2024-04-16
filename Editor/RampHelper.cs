@@ -1,4 +1,5 @@
-﻿using System;
+﻿// Copyright (c) Jason Ma
+using System;
 using System.IO;
 using System.Linq;
 using UnityEditor;
@@ -10,12 +11,7 @@ namespace LWGUI
 	public class RampHelper
 	{
 		#region RampEditor
-		[Serializable]
-		public class GradientObject : ScriptableObject
-		{
-			[SerializeField] public Gradient gradient = new Gradient();
-		}
-		
+
 		public static readonly string projectPath = Application.dataPath.Substring(0, Application.dataPath.Length - 6);
 
 		public static string lastSavePath
@@ -32,8 +28,6 @@ namespace LWGUI
 										   _iconEdit    = new GUIContent(EditorGUIUtility.IconContent("editicon.sml").image, "Edit"),
 										   _iconDiscard = new GUIContent(EditorGUIUtility.IconContent("d_TreeEditor.Refresh").image, "Discard"),
 										   _iconSave    = new GUIContent(EditorGUIUtility.IconContent("SaveActive").image, "Save");
-
-		private static readonly GUIStyle _styleEdit = new GUIStyle("button");
 
 		public static bool RampEditor(
 			Rect               buttonRect,
@@ -86,7 +80,7 @@ namespace LWGUI
 			if (currEvent.type == EventType.Repaint)
 			{
 				var isHover = editRect.Contains(currEvent.mousePosition);
-				_styleEdit.Draw(editRect, _iconEdit, isHover, false, false, false);
+				(new GUIStyle("button")).Draw(editRect, _iconEdit, isHover, false, false, false);
 			}
 			
 			// Create button
@@ -94,6 +88,9 @@ namespace LWGUI
 			{
 				while (true)
 				{
+					if (!Directory.Exists(projectPath + rootPath))
+						Directory.CreateDirectory(projectPath + rootPath);
+
 					var absPath = EditorUtility.SaveFilePanel("Create New Ramp Texture", rootPath, defaultFileName, "png");
 					
 					if (absPath.StartsWith(projectPath + rootPath))
@@ -130,7 +127,7 @@ namespace LWGUI
 			return hasChange;
 		}
 
-		public static bool HasGradient(AssetImporter assetImporter) { return assetImporter.userData.Contains("LWGUI");}
+		public static bool HasGradient(AssetImporter assetImporter) { return assetImporter.userData.Contains("#");}
 		
 		public static Gradient GetGradientFromTexture(Texture texture, out bool isDirty, bool doReimport = false)
 		{

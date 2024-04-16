@@ -1,4 +1,5 @@
-﻿using UnityEditor;
+﻿// Copyright (c) Jason Ma
+using UnityEditor;
 using UnityEditor.VersionControl;
 using UnityEngine;
 
@@ -7,7 +8,20 @@ namespace LWGUI
 	public class VersionControlHelper
 	{
 		public static bool isVCEnabled { get { return Provider.enabled && Provider.isActive; } }
-		
+
+		public static bool Checkout(UnityEngine.Object obj)
+		{
+			if (AssetDatabase.Contains(obj))
+			{
+				var path = AssetDatabase.GetAssetPath(obj);
+				return Checkout(path);
+			}
+			else
+			{
+				return true;
+			}
+		}
+
 		public static bool Checkout(string projectRelativedPath)
 		{
 			if (isVCEnabled)
@@ -25,6 +39,10 @@ namespace LWGUI
 						{
 							return true;
 						}
+					}
+					else if (Provider.IsOpenForEdit(vcAsset))
+					{
+						return true;
 					}
 				}
 				
